@@ -24,11 +24,30 @@ import java.sql.Connection
  * A `ZConnectionPool` represents a pool of connections, and has the ability to
  * supply a transaction that can be used for executing SQL statements.
  */
-final class ZConnectionPool private (
-  private val txn: ZLayer[Any, Throwable, ZConnection],
-  private val underlying: ZPool[Throwable, ZConnection]
-) {
-  val transaction: ZLayer[Any, Throwable, ZConnection] = txn
+trait ZConnectionPool {
+  val transaction: ZLayer[Any, Throwable, ZConnection]
+  def invalidate(zc: ZConnection): Task[Unit]
+}
+
+private class ZPoolImpl(
+  underlying: ZPool[Throwable, ZConnection]
+) extends ZConnectionPool {
+  val transaction: ZLayer[Any, Throwable, ZConnection] =
+    ZLayer.scoped {
+      for {
+        connection <- underlying.get
+        _          <- ZIO.addFinalizerExit { exit =>
+                        connection.isValid().orDie.flatMap {
+                          case true => exit match {
+                            case Exit.Success(_) => UIO.unit
+                            case Exit.Failure(_) => ZIO.succeed(connection.connection.rollback())
+                          }
+                          case false =>
+                            invalidate(connection).orDie
+                        }
+                      }
+      } yield connection
+    }
   def invalidate(zc: ZConnection): Task[Unit]          =
     zc.access { conn =>
       if (conn.isClosed()) ()
@@ -36,6 +55,7 @@ final class ZConnectionPool private (
     }
       .ensuring(underlying.invalidate(zc))
 }
+
 object ZConnectionPool {
   def h2test: ZLayer[Any, Throwable, ZConnectionPool] =
     ZLayer.scoped {
@@ -172,17 +192,6 @@ object ZConnectionPool {
         pool   <-
           ZPool
             .make(managed.map(ZConnection(_)), Range(config.minConnections, config.maxConnections), config.timeToLive)
-      } yield new ZConnectionPool(
-        ZLayer.scoped {
-          for {
-            connection <- pool.get
-            _          <- ZIO.addFinalizerExit {
-                            case Exit.Success(_) => UIO.unit
-                            case Exit.Failure(_) => ZIO.succeed(connection.connection.rollback())
-                          }
-          } yield connection
-        },
-        pool
-      )
+      } yield new ZPoolImpl(pool)
     }
 }
